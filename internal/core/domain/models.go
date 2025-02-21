@@ -14,6 +14,9 @@ type CrackingJob struct {
 	Algorithm       CrackingAlgorithm
 	Settings        CrackingSettings
 	ResourceMetrics ResourceMetrics
+	AttemptCount    int64
+	LastAttempt     time.Time
+	ErrorMessage    string
 }
 
 type CrackingSettings struct {
@@ -27,6 +30,9 @@ type CrackingSettings struct {
 	TimeoutMinutes int
 	TargetURL      string
 	ProxySettings  *ProxySettings
+	Priority       int
+	MaxAttempts    int64
+	RetryCount     int
 }
 
 type ProxySettings struct {
