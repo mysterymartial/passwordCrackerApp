@@ -51,7 +51,10 @@ func (d *Dictionary) Start(ctx context.Context) (<-chan string, <-chan error) {
 
 			fileInfo, err := file.Stat()
 			if err != nil {
-				file.Close()
+				err := file.Close()
+				if err != nil {
+					return
+				}
 				errors <- err
 				return
 			}
@@ -61,11 +64,14 @@ func (d *Dictionary) Start(ctx context.Context) (<-chan string, <-chan error) {
 
 			for scanner.Scan() {
 				word := scanner.Text()
-				processedBytes += int64(len(word) + 1) // +1 for newline
+				processedBytes += int64(len(word) + 1)
 
 				d.attempts++
 				if err := d.processWord(ctx, word, passwords); err != nil {
-					file.Close()
+					err := file.Close()
+					if err != nil {
+						return
+					}
 					errors <- err
 					return
 				}
@@ -75,14 +81,16 @@ func (d *Dictionary) Start(ctx context.Context) (<-chan string, <-chan error) {
 						d.attempts++
 						modified := d.applyRule(word, rule)
 						if err := d.processWord(ctx, modified, passwords); err != nil {
-							file.Close()
+							err := file.Close()
+							if err != nil {
+								return
+							}
 							errors <- err
 							return
 						}
 					}
 				}
 
-				// Update progress based on file position
 				fileProgress := float64(processedBytes) / float64(fileInfo.Size())
 				d.mu.Lock()
 				d.progress = (float64(fileIndex) + fileProgress) / float64(totalFiles)
@@ -90,7 +98,10 @@ func (d *Dictionary) Start(ctx context.Context) (<-chan string, <-chan error) {
 				d.updateMetrics()
 			}
 
-			file.Close()
+			err = file.Close()
+			if err != nil {
+				return
+			}
 			if err := scanner.Err(); err != nil {
 				errors <- err
 				return
