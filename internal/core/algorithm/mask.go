@@ -8,18 +8,18 @@ import (
 	"strconv"
 	"strings"
 	"sync"
-	"time"
+	"sync/atomic"
 )
 
 type Mask struct {
-	job       *domain.CrackingJob
-	settings  domain.CrackingSettings
-	progress  float64
-	mu        sync.RWMutex
-	stop      chan struct{}
-	charsets  map[rune]string
-	attempts  int64
-	startTime time.Time
+	settings      domain.CrackingSettings
+	progress      float64
+	mu            sync.RWMutex
+	stop          chan struct{}
+	charsets      map[rune]string
+	attempts      int64
+	totalPatterns int64
+	processed     int64
 }
 
 func NewMask() *Mask {
@@ -32,13 +32,7 @@ func NewMask() *Mask {
 			's': domain.CharsetSpecial,
 			'a': domain.CharsetAll,
 		},
-		startTime: time.Now(),
 	}
-}
-
-func (m *Mask) SetJob(job *domain.CrackingJob) {
-	m.job = job
-	m.settings = job.Settings
 }
 
 func (m *Mask) Start(ctx context.Context) (<-chan string, <-chan error) {
@@ -48,42 +42,64 @@ func (m *Mask) Start(ctx context.Context) (<-chan string, <-chan error) {
 	go func() {
 		defer close(passwords)
 		defer close(errors)
-		defer m.updateMetrics()
 
 		if len(m.settings.CustomRules) == 0 {
 			errors <- fmt.Errorf("no mask patterns specified")
 			return
 		}
 
-		totalPatterns := len(m.settings.CustomRules)
-		for i, rule := range m.settings.CustomRules {
-			masks := m.expandMaskPattern(rule)
-			for _, mask := range masks {
-				if err := m.generateFromMask(ctx, mask, "", passwords); err != nil {
-					errors <- err
-					return
-				}
-			}
-			m.mu.Lock()
-			m.progress = float64(i+1) / float64(totalPatterns)
-			m.mu.Unlock()
-			m.updateMetrics()
+		m.totalPatterns = int64(len(m.settings.CustomRules))
+
+		// Use worker pool for parallel processing
+		workerCount := 4
+		patternChan := make(chan string, m.totalPatterns)
+
+		var wg sync.WaitGroup
+		for i := 0; i < workerCount; i++ {
+			wg.Add(1)
+			go m.worker(ctx, patternChan, passwords, errors, &wg)
 		}
+
+		// Feed patterns to workers
+		for _, rule := range m.settings.CustomRules {
+			patternChan <- rule
+		}
+		close(patternChan)
+
+		wg.Wait()
 	}()
 
 	return passwords, errors
 }
 
+func (m *Mask) worker(ctx context.Context, patterns <-chan string, passwords chan<- string, errors chan<- error, wg *sync.WaitGroup) {
+	defer wg.Done()
+
+	for pattern := range patterns {
+		masks := m.expandMaskPattern(pattern)
+		for _, mask := range masks {
+			if err := m.generateFromMask(ctx, mask, "", passwords); err != nil {
+				select {
+				case errors <- err:
+				case <-ctx.Done():
+					return
+				}
+				return
+			}
+		}
+		atomic.AddInt64(&m.processed, 1)
+		m.updateProgress()
+	}
+}
+
 func (m *Mask) expandMaskPattern(pattern string) []string {
 	var masks []string
 
-	// Handle direct mask patterns (?l?d?d?d)
 	if strings.HasPrefix(pattern, "?") {
 		masks = append(masks, pattern)
 		return masks
 	}
 
-	// Handle custom pattern syntax [lower]{1}[digits]{3}
 	re := regexp.MustCompile(`\[([^\]]+)\]\{(\d+)\}`)
 	matches := re.FindAllStringSubmatch(pattern, -1)
 
@@ -93,20 +109,7 @@ func (m *Mask) expandMaskPattern(pattern string) []string {
 			charsetType := match[1]
 			count, _ := strconv.Atoi(match[2])
 
-			var charsetSymbol string
-			switch charsetType {
-			case "lower":
-				charsetSymbol = "?l"
-			case "upper":
-				charsetSymbol = "?u"
-			case "digits":
-				charsetSymbol = "?d"
-			case "special":
-				charsetSymbol = "?s"
-			case "all":
-				charsetSymbol = "?a"
-			}
-
+			charsetSymbol := m.getCharsetSymbol(charsetType)
 			expandedMask.WriteString(strings.Repeat(charsetSymbol, count))
 		}
 		masks = append(masks, expandedMask.String())
@@ -115,13 +118,30 @@ func (m *Mask) expandMaskPattern(pattern string) []string {
 	return masks
 }
 
+func (m *Mask) getCharsetSymbol(charsetType string) string {
+	switch charsetType {
+	case "lower":
+		return "?l"
+	case "upper":
+		return "?u"
+	case "digits":
+		return "?d"
+	case "special":
+		return "?s"
+	case "all":
+		return "?a"
+	default:
+		return "?a"
+	}
+}
+
 func (m *Mask) generateFromMask(ctx context.Context, mask, current string, passwords chan<- string) error {
 	if len(current) > m.settings.MaxLength {
 		return nil
 	}
 
 	if len(current) >= m.settings.MinLength && len(current) <= m.settings.MaxLength {
-		m.attempts++
+		atomic.AddInt64(&m.attempts, 1)
 		select {
 		case passwords <- current:
 		case <-ctx.Done():
@@ -145,16 +165,10 @@ func (m *Mask) generateFromMask(ctx context.Context, mask, current string, passw
 	return nil
 }
 
-func (m *Mask) updateMetrics() {
-	if m.job != nil {
-		duration := time.Since(m.startTime).Seconds()
-		m.job.ResourceMetrics.AttemptsPerSec = int64(float64(m.attempts) / duration)
-		m.job.ResourceMetrics.TotalAttempts = m.attempts
-		m.job.ResourceMetrics.LastUpdated = time.Now()
-		m.job.AttemptCount = m.attempts
-		m.job.LastAttempt = time.Now()
-		m.job.Progress = m.progress
-	}
+func (m *Mask) updateProgress() {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	m.progress = float64(atomic.LoadInt64(&m.processed)) / float64(m.totalPatterns) * 100
 }
 
 func (m *Mask) Stop() {

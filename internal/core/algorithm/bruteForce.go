@@ -2,6 +2,7 @@ package algorithm
 
 import (
 	"context"
+	"math"
 	"passwordCrakerBackend/internal/core/domain"
 	"sync"
 )
@@ -34,6 +35,9 @@ func (b *BruteForce) Start(ctx context.Context) (<-chan string, <-chan error) {
 			charset = domain.CharsetAll
 		}
 
+		// Calculate total combinations for progress tracking
+		b.calculateTotalCombinations(charset)
+
 		for length := b.settings.MinLength; length <= b.settings.MaxLength; length++ {
 			b.currentLen = length
 			b.generatePasswords(ctx, charset, "", length, passwords)
@@ -44,6 +48,7 @@ func (b *BruteForce) Start(ctx context.Context) (<-chan string, <-chan error) {
 			case <-b.stop:
 				return
 			default:
+				b.updateProgress(length)
 				continue
 			}
 		}
@@ -67,6 +72,27 @@ func (b *BruteForce) generatePasswords(ctx context.Context, charset string, curr
 	for _, char := range charset {
 		b.generatePasswords(ctx, charset, current+string(char), length-1, passwords)
 	}
+}
+
+func (b *BruteForce) calculateTotalCombinations(charset string) {
+	charsetLen := float64(len(charset))
+	total := int64(0)
+
+	for length := b.settings.MinLength; length <= b.settings.MaxLength; length++ {
+		total += int64(math.Pow(charsetLen, float64(length)))
+	}
+
+	b.combinations = total
+}
+
+func (b *BruteForce) updateProgress(currentLength int) {
+	b.mu.Lock()
+	defer b.mu.Unlock()
+
+	charsetLen := float64(len(b.settings.CharacterSet))
+	currentCombinations := int64(math.Pow(charsetLen, float64(currentLength)))
+
+	b.progress = (float64(currentCombinations) / float64(b.combinations)) * 100
 }
 
 func (b *BruteForce) Stop() {

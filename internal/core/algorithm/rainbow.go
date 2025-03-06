@@ -5,15 +5,15 @@ import (
 	"crypto/md5"
 	"crypto/sha1"
 	"crypto/sha256"
+	"crypto/sha512"
 	"encoding/hex"
 	"passwordCrakerBackend/internal/core/domain"
 	"passwordCrakerBackend/internal/utils/random"
 	"sync"
-	"time"
+	"sync/atomic"
 )
 
 type Rainbow struct {
-	job         *domain.CrackingJob
 	settings    domain.CrackingSettings
 	progress    float64
 	chainLength int
@@ -21,8 +21,9 @@ type Rainbow struct {
 	mu          sync.RWMutex
 	stop        chan struct{}
 	chainTable  map[string]string
-	startTime   time.Time
 	attempts    int64
+	hashType    domain.HashType
+	targetHash  string
 }
 
 func NewRainbow() *Rainbow {
@@ -34,12 +35,6 @@ func NewRainbow() *Rainbow {
 	}
 }
 
-func (r *Rainbow) SetJob(job *domain.CrackingJob) {
-	r.job = job
-	r.settings = job.Settings
-	r.startTime = time.Now()
-}
-
 func (r *Rainbow) Start(ctx context.Context) (<-chan string, <-chan error) {
 	passwords := make(chan string)
 	errors := make(chan error)
@@ -47,57 +42,74 @@ func (r *Rainbow) Start(ctx context.Context) (<-chan string, <-chan error) {
 	go func() {
 		defer close(passwords)
 		defer close(errors)
-		defer r.updateMetrics()
 
-		if r.job == nil || r.job.TargetHash == "" {
+		if r.targetHash == "" {
 			errors <- domain.ErrInvalidHash
 			return
 		}
 
-		r.generateTable(ctx)
+		if err := r.generateTableParallel(ctx); err != nil {
+			errors <- err
+			return
+		}
 
-		endpoint := r.reduce(r.job.TargetHash, r.chainLength-1)
-		for i := r.chainLength - 1; i >= 0; i-- {
-			r.attempts++
-			if startPoint, exists := r.chainTable[endpoint]; exists {
-				candidate := r.reconstructChain(startPoint, i)
-				hash := r.hash(candidate)
-				if hash == r.job.TargetHash {
-					r.job.FoundPassword = candidate
-					r.job.EndTime = time.Now()
-					select {
-					case passwords <- candidate:
-					case <-ctx.Done():
-						return
-					case <-r.stop:
-						return
-					}
-				}
+		if found, password := r.searchPassword(ctx); found {
+			select {
+			case passwords <- password:
+			case <-ctx.Done():
+			case <-r.stop:
 			}
-			endpoint = r.reduce(endpoint, i-1)
 		}
 	}()
 
 	return passwords, errors
 }
 
-func (r *Rainbow) generateTable(ctx context.Context) {
+func (r *Rainbow) generateTableParallel(ctx context.Context) error {
+	workerCount := 4
+	workChan := make(chan int, r.tableSize)
+	var wg sync.WaitGroup
+
+	for i := 0; i < workerCount; i++ {
+		wg.Add(1)
+		go r.tableWorker(ctx, &wg, workChan)
+	}
+
+	go func() {
+		for i := 0; i < r.tableSize; i++ {
+			select {
+			case workChan <- i:
+			case <-ctx.Done():
+				return
+			case <-r.stop:
+				return
+			}
+		}
+		close(workChan)
+	}()
+
+	wg.Wait()
+	return nil
+}
+
+func (r *Rainbow) tableWorker(ctx context.Context, wg *sync.WaitGroup, work <-chan int) {
+	defer wg.Done()
+
 	charset := r.settings.CharacterSet
 	if charset == "" {
 		charset = domain.CharsetAll
 	}
 
-	for i := 0; i < r.tableSize; i++ {
+	for range work {
 		startPoint := random.GenerateRandomString(charset, r.settings.MinLength)
 		endpoint := r.generateChain(startPoint)
-		r.chainTable[endpoint] = startPoint
 
 		r.mu.Lock()
-		r.progress = float64(i) / float64(r.tableSize)
-		r.attempts++
+		r.chainTable[endpoint] = startPoint
 		r.mu.Unlock()
 
-		r.updateMetrics()
+		atomic.AddInt64(&r.attempts, 1)
+		r.updateProgress()
 
 		select {
 		case <-ctx.Done():
@@ -109,17 +121,8 @@ func (r *Rainbow) generateTable(ctx context.Context) {
 	}
 }
 
-func (r *Rainbow) generateChain(startPoint string) string {
-	current := startPoint
-	for i := 0; i < r.chainLength; i++ {
-		hash := r.hash(current)
-		current = r.reduce(hash, i)
-	}
-	return current
-}
-
 func (r *Rainbow) hash(input string) string {
-	switch r.job.HashType {
+	switch r.hashType {
 	case domain.HashMD5:
 		hash := md5.Sum([]byte(input))
 		return hex.EncodeToString(hash[:])
@@ -129,9 +132,39 @@ func (r *Rainbow) hash(input string) string {
 	case domain.HashSHA256:
 		hash := sha256.Sum256([]byte(input))
 		return hex.EncodeToString(hash[:])
+	case domain.HashSHA512:
+		hash := sha512.Sum512([]byte(input))
+		return hex.EncodeToString(hash[:])
 	default:
 		return input
 	}
+}
+
+func (r *Rainbow) searchPassword(ctx context.Context) (bool, string) {
+	endpoint := r.reduce(r.targetHash, r.chainLength-1)
+
+	for i := r.chainLength - 1; i >= 0; i-- {
+		atomic.AddInt64(&r.attempts, 1)
+
+		if startPoint, exists := r.chainTable[endpoint]; exists {
+			if candidate := r.reconstructChain(startPoint, i); candidate != "" {
+				if r.hash(candidate) == r.targetHash {
+					return true, candidate
+				}
+			}
+		}
+		endpoint = r.reduce(endpoint, i-1)
+	}
+	return false, ""
+}
+
+func (r *Rainbow) generateChain(startPoint string) string {
+	current := startPoint
+	for i := 0; i < r.chainLength; i++ {
+		hash := r.hash(current)
+		current = r.reduce(hash, i)
+	}
+	return current
 }
 
 func (r *Rainbow) reduce(hash string, position int) string {
@@ -163,16 +196,10 @@ func (r *Rainbow) reconstructChain(startPoint string, position int) string {
 	return current
 }
 
-func (r *Rainbow) updateMetrics() {
-	if r.job != nil {
-		duration := time.Since(r.startTime).Seconds()
-		r.job.ResourceMetrics.AttemptsPerSec = int64(float64(r.attempts) / duration)
-		r.job.ResourceMetrics.TotalAttempts = r.attempts
-		r.job.ResourceMetrics.LastUpdated = time.Now()
-		r.job.AttemptCount = r.attempts
-		r.job.LastAttempt = time.Now()
-		r.job.Progress = r.progress
-	}
+func (r *Rainbow) updateProgress() {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	r.progress = float64(atomic.LoadInt64(&r.attempts)) / float64(r.tableSize*r.chainLength) * 100
 }
 
 func (r *Rainbow) Stop() {
@@ -187,4 +214,10 @@ func (r *Rainbow) Progress() float64 {
 
 func (r *Rainbow) Name() domain.CrackingAlgorithm {
 	return domain.AlgoRainbow
+}
+
+func (r *Rainbow) SetSettings(settings domain.CrackingSettings) {
+	r.settings = settings
+	r.hashType = settings.HashType
+	r.targetHash = settings.TargetHash
 }

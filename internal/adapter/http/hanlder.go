@@ -1,70 +1,81 @@
-package http
+package handler
 
-//import (
-//	"encoding/json"
-//	"net/http"
-//	"password-cracker/internal/core/domain"
-//	"password-cracker/internal/ports"
-//)
-//
-//type Handler struct {
-//	crackerService ports.CrackerService
-//}
-//
-//func NewHandler(service ports.CrackerService) *Handler {
-//	return &Handler{
-//		crackerService: service,
-//	}
-//}
-//
-//type StartCrackingRequest struct {
-//	Hash     string                  `json:"hash"`
-//	Settings domain.CrackingSettings `json:"settings"`
-//}
-//
-//func (h *Handler) StartCracking(w http.ResponseWriter, r *http.Request) {
-//	var req StartCrackingRequest
-//	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
-//		http.Error(w, "Invalid request body", http.StatusBadRequest)
-//		return
-//	}
-//
-//	job, err := h.crackerService.StartCracking(r.Context(), req.Hash, req.Settings)
-//	if err != nil {
-//		http.Error(w, err.Error(), http.StatusInternalServerError)
-//		return
-//	}
-//
-//	json.NewEncoder(w).Encode(job)
-//}
-//
-//func (h *Handler) GetJobStatus(w http.ResponseWriter, r *http.Request) {
-//	jobID := r.URL.Query().Get("id")
-//	if jobID == "" {
-//		http.Error(w, "Job ID is required", http.StatusBadRequest)
-//		return
-//	}
-//
-//	job, err := h.crackerService.GetJobStatus(r.Context(), jobID)
-//	if err != nil {
-//		http.Error(w, err.Error(), http.StatusInternalServerError)
-//		return
-//	}
-//
-//	json.NewEncoder(w).Encode(job)
-//}
-//
-//func (h *Handler) StopCracking(w http.ResponseWriter, r *http.Request) {
-//	jobID := r.URL.Query().Get("id")
-//	if jobID == "" {
-//		http.Error(w, "Job ID is required", http.StatusBadRequest)
-//		return
-//	}
-//
-//	if err := h.crackerService.StopCracking(r.Context(), jobID); err != nil {
-//		http.Error(w, err.Error(), http.StatusInternalServerError)
-//		return
-//	}
-//
-//	w.WriteHeader(http.StatusOK)
-//}
+import (
+	"github.com/gin-gonic/gin"
+	"passwordCrakerBackend/internal/core/domain"
+	"passwordCrakerBackend/internal/core/service"
+)
+
+type CrackingHandler struct {
+	crackingService *service.CrackingService
+}
+
+type CrackRequest struct {
+	Hash     string                  `json:"hash" binding:"required"`
+	Settings domain.CrackingSettings `json:"settings" binding:"required"`
+}
+
+func NewCrackingHandler(svc *service.CrackingService) *CrackingHandler {
+	return &CrackingHandler{
+		crackingService: svc,
+	}
+}
+
+func (h *CrackingHandler) StartCracking(c *gin.Context) {
+	var req CrackRequest
+	if err := c.ShouldBindJSON(&req); err != nil {
+		c.JSON(400, gin.H{"error": err.Error()})
+		return
+	}
+
+	job, err := h.crackingService.StartCracking(c.Request.Context(), req.Hash, req.Settings)
+	if err != nil {
+		c.JSON(500, gin.H{"error": err.Error()})
+		return
+	}
+
+	c.JSON(200, job)
+}
+
+func (h *CrackingHandler) GetProgress(c *gin.Context) {
+	jobID := c.Param("jobId")
+	progress, err := h.crackingService.GetProgress(c.Request.Context(), jobID)
+	if err != nil {
+		c.JSON(404, gin.H{"error": err.Error()})
+		return
+	}
+
+	c.JSON(200, progress)
+}
+
+func (h *CrackingHandler) StopCracking(c *gin.Context) {
+	jobID := c.Param("jobId")
+	err := h.crackingService.StopCracking(c.Request.Context(), jobID)
+	if err != nil {
+		c.JSON(500, gin.H{"error": err.Error()})
+		return
+	}
+
+	c.JSON(200, gin.H{"message": "Cracking stopped successfully"})
+}
+
+func (h *CrackingHandler) GetResults(c *gin.Context) {
+	jobID := c.Param("jobId")
+	results, err := h.crackingService.GetResults(c.Request.Context(), jobID)
+	if err != nil {
+		c.JSON(404, gin.H{"error": err.Error()})
+		return
+	}
+
+	c.JSON(200, results)
+}
+
+func (h *CrackingHandler) ListJobs(c *gin.Context) {
+	jobs, err := h.crackingService.ListJobs(c.Request.Context())
+	if err != nil {
+		c.JSON(500, gin.H{"error": err.Error()})
+		return
+	}
+
+	c.JSON(200, jobs)
+}

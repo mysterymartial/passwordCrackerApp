@@ -1,290 +1,225 @@
-package services
+package service
 
 import (
 	"context"
-	"passwordCrakerBackend/internal/core/algorithm"
+	"github.com/google/uuid"
+	"passwordCrakerBackend/internal/algorithm"
 	"passwordCrakerBackend/internal/core/domain"
-	"passwordCrakerBackend/internal/pkg/concurrency"
-	"passwordCrakerBackend/internal/pkg/metrics"
+	"passwordCrakerBackend/internal/metrics"
 	"passwordCrakerBackend/internal/port"
 	"runtime"
 	"sync"
 	"time"
 )
 
-const (
-	MaxConcurrentAlgorithms = 6
-	WorkerPoolBufferSize    = 100
-	MetricsUpdateInterval   = time.Second
-	DefaultTimeout          = 30 * time.Minute
-	MaxAttempts             = 1000000000 // 1 billion attempts limit
-	ResultBufferSize        = 10
-)
-
 type CrackingService struct {
-	repo        port.Repository
-	hashService port.HashService
-	algorithms  map[domain.CrackingAlgorithm]algorithm.Algorithm
-	activeJobs  sync.Map
-	metrics     *metrics.Collector
-	reporter    *metrics.Reporter
-	workerPool  *concurrency.WorkerPool
-	resultCache *sync.Map
+	repo             port.Repository
+	hashService      port.HashService
+	metricsCollector *metrics.Collector
+	algorithms       map[domain.CrackingAlgorithm]algorithm.Algorithm
+	batchSize        int
+	workerPool       chan struct{}
 }
 
-func NewCrackingService(
-	repo port.Repository,
-	hashService port.HashService,
-	algorithms map[domain.CrackingAlgorithm]algorithm.Algorithm,
-) port.CrackingService {
-	reporter, _ := metrics.NewReporter("cracking_metrics.log")
-
-	// Optimize worker pool size based on available CPU cores
-	maxWorkers := runtime.NumCPU() * 2
-	if maxWorkers > MaxConcurrentAlgorithms {
-		maxWorkers = MaxConcurrentAlgorithms
-	}
-
+func NewCrackingService(repo port.Repository, hashSvc port.HashService) *CrackingService {
 	return &CrackingService{
-		repo:        repo,
-		hashService: hashService,
-		algorithms:  algorithms,
-		activeJobs:  sync.Map{},
-		metrics:     metrics.NewCollector(MetricsUpdateInterval),
-		reporter:    reporter,
-		workerPool:  concurrency.NewWorkerPool(maxWorkers, WorkerPoolBufferSize),
-		resultCache: &sync.Map{},
+		repo:             repo,
+		hashService:      hashSvc,
+		metricsCollector: metrics.NewCollector(),
+		algorithms: map[domain.CrackingAlgorithm]algorithm.Algorithm{
+			domain.AlgoBruteForce: algorithm.NewBruteForce(),
+			domain.AlgoDictionary: algorithm.NewDictionary(),
+			domain.AlgoMarkov:     algorithm.NewMarkov(),
+			domain.AlgoHybrid:     algorithm.NewHybrid(),
+			domain.AlgoMask:       algorithm.NewMask(),
+			domain.AlgoRainbow:    algorithm.NewRainbow(),
+		},
+		batchSize:  1000,
+		workerPool: make(chan struct{}, runtime.NumCPU()),
 	}
 }
 
 func (s *CrackingService) StartCracking(ctx context.Context, hash string, settings domain.CrackingSettings) (*domain.CrackingJob, error) {
-	// Validate hash
-	hashType := s.hashService.Identify(hash)
-	if hashType == "" {
-		return nil, domain.ErrInvalidHash
-	}
-
-	// Create job with unique ID
 	job := &domain.CrackingJob{
-		ID:           random.GenerateUUID(),
-		TargetHash:   hash,
-		HashType:     hashType,
-		Status:       domain.StatusRunning,
-		StartTime:    time.Now(),
-		Settings:     settings,
-		AttemptCount: 0,
-		LastAttempt:  time.Now(),
-		Progress:     0.0,
+		ID:         uuid.New().String(),
+		TargetHash: hash,
+		Status:     domain.StatusRunning,
+		StartTime:  time.Now(),
+		Settings:   settings,
 	}
 
-	// Save job to repository
 	if err := s.repo.SaveJob(ctx, job); err != nil {
 		return nil, err
 	}
 
-	// Initialize metrics and caching
-	s.activeJobs.Store(job.ID, job)
-	s.metrics.StartCollection(job.ID)
+	s.metricsCollector.StartJob(job.ID)
 
-	// Start cracking process
-	go s.orchestrateCracking(ctx, job)
+	resultChan := make(chan domain.CrackResult)
+	errorChan := make(chan error)
+
+	var wg sync.WaitGroup
+	for algo := range s.algorithms {
+		wg.Add(1)
+		go func(alg algorithm.Algorithm) {
+			defer wg.Done()
+			s.runAlgorithm(ctx, job, alg, resultChan, errorChan)
+		}(s.algorithms[algo])
+	}
+
+	go s.monitorProgress(ctx, job, resultChan, errorChan, &wg)
 
 	return job, nil
 }
 
-func (s *CrackingService) orchestrateCracking(ctx context.Context, job *domain.CrackingJob) {
-	resultChan := make(chan domain.CrackResult, ResultBufferSize)
-	errorChan := make(chan error, MaxConcurrentAlgorithms)
+func (s *CrackingService) runAlgorithm(
+	ctx context.Context,
+	job *domain.CrackingJob,
+	alg algorithm.Algorithm,
+	resultChan chan<- domain.CrackResult,
+	errorChan chan<- error,
+) {
+	s.workerPool <- struct{}{}        // Acquire worker
+	defer func() { <-s.workerPool }() // Release worker
 
-	// Set timeout
-	timeout := time.Duration(job.Settings.TimeoutMinutes) * time.Minute
-	if timeout == 0 {
-		timeout = DefaultTimeout
+	passwords, errors := alg.Start(ctx)
+	batch := make([]string, 0, s.batchSize)
+
+	for {
+		select {
+		case <-ctx.Done():
+			return
+		case err := <-errors:
+			errorChan <- err
+			return
+		case pwd, ok := <-passwords:
+			if !ok {
+				return
+			}
+
+			batch = append(batch, pwd)
+			if len(batch) >= s.batchSize {
+				if found := s.verifyPasswordBatch(batch, job); found != "" {
+					resultChan <- domain.CrackResult{
+						Password:  found,
+						Algorithm: alg.Name(),
+						TimeTaken: time.Since(job.StartTime),
+					}
+					return
+				}
+				batch = batch[:0]
+			}
+		}
 	}
+}
 
-	ctxWithTimeout, cancel := context.WithTimeout(ctx, timeout)
-	defer cancel()
-
-	// Start all algorithms
-	wg := &sync.WaitGroup{}
-	for algType, alg := range s.algorithms {
-		wg.Add(1)
-		go func(at domain.CrackingAlgorithm, a algorithm.Algorithm) {
-			defer wg.Done()
-			s.executeAlgorithm(ctxWithTimeout, job, a, at, resultChan, errorChan)
-		}(algType, alg)
+func (s *CrackingService) verifyPasswordBatch(batch []string, job *domain.CrackingJob) string {
+	for _, pwd := range batch {
+		if s.hashService.Verify(pwd, job.TargetHash) {
+			return pwd
+		}
 	}
+	return ""
+}
 
-	// Monitor results in separate goroutine
+func (s *CrackingService) monitorProgress(
+	ctx context.Context,
+	job *domain.CrackingJob,
+	resultChan <-chan domain.CrackResult,
+	errorChan <-chan error,
+	wg *sync.WaitGroup,
+) {
 	go func() {
 		wg.Wait()
 		close(resultChan)
 		close(errorChan)
 	}()
 
-	s.handleResults(ctxWithTimeout, job, resultChan, errorChan)
-}
-
-func (s *CrackingService) executeAlgorithm(
-	ctx context.Context,
-	job *domain.CrackingJob,
-	alg algorithm.Algorithm,
-	algType domain.CrackingAlgorithm,
-	resultChan chan<- domain.CrackResult,
-	errorChan chan<- error,
-) {
-	defer s.metrics.StopCollection(job.ID)
-
-	passwordChan, errChan := alg.Start(ctx, job.Settings)
-	startTime := time.Now()
-	attempts := int64(0)
-
 	for {
 		select {
-		case password, ok := <-passwordChan:
+		case result, ok := <-resultChan:
 			if !ok {
-				return
-			}
-
-			attempts++
-			if attempts > MaxAttempts {
-				errorChan <- domain.ErrMaxAttemptsReached
-				return
-			}
-
-			s.updateJobMetrics(job.ID, attempts)
-
-			if s.hashService.Verify(password, job.TargetHash, job.HashType) {
-				result := domain.CrackResult{
-					Password:     password,
-					TimeTaken:    time.Since(startTime),
-					AttemptsUsed: attempts,
-					Algorithm:    algType,
-					Pattern:      alg.GetPattern(),
-					Complexity:   s.analyzePassword(password, startTime),
-				}
-				resultChan <- result
-				return
-			}
-
-		case err := <-errChan:
-			errorChan <- err
-			return
-
-		case <-ctx.Done():
-			return
-		}
-	}
-}
-
-func (s *CrackingService) handleResults(
-	ctx context.Context,
-	job *domain.CrackingJob,
-	resultChan <-chan domain.CrackResult,
-	errorChan <-chan error,
-) {
-	var result *domain.CrackResult
-	var errors []error
-
-	for {
-		select {
-		case r, ok := <-resultChan:
-			if !ok {
-				resultChan = nil
 				continue
 			}
-			if result == nil || r.TimeTaken < result.TimeTaken {
-				result = &r
-			}
+			s.handleSuccess(ctx, job, result)
+			return
 
 		case err, ok := <-errorChan:
 			if !ok {
-				errorChan = nil
 				continue
 			}
-			errors = append(errors, err)
+			s.handleError(ctx, job, err)
 
 		case <-ctx.Done():
-			s.finalizeJob(ctx, job, result, errors)
-			return
-		}
-
-		if resultChan == nil && errorChan == nil {
-			s.finalizeJob(ctx, job, result, errors)
+			s.handleCancellation(ctx, job)
 			return
 		}
 	}
 }
 
-func (s *CrackingService) finalizeJob(
-	ctx context.Context,
-	job *domain.CrackingJob,
-	result *domain.CrackResult,
-	errors []error,
-) {
-	if result != nil {
-		job.Status = domain.StatusSuccess
-		job.Result = result
-	} else {
-		job.Status = domain.StatusFailed
-		job.Errors = errors
-	}
-
+func (s *CrackingService) handleSuccess(ctx context.Context, job *domain.CrackingJob, result domain.CrackResult) {
+	job.Status = domain.StatusComplete
+	job.FoundPassword = result.Password
 	job.EndTime = time.Now()
-	job.TimeTaken = job.EndTime.Sub(job.StartTime)
-
-	// Update repository
-	if err := s.repo.UpdateJob(ctx, job); err != nil {
-		s.reporter.Error("Failed to update job", err)
-	}
-
-	// Cleanup
-	s.activeJobs.Delete(job.ID)
-	s.metrics.StopCollection(job.ID)
+	job.SuccessfulAlgorithm = result.Algorithm
+	s.repo.UpdateJob(ctx, job)
+	s.stopAllAlgorithms()
 }
 
-func (s *CrackingService) GetJobStatus(ctx context.Context, jobID string) (*domain.CrackingJob, error) {
+func (s *CrackingService) handleError(ctx context.Context, job *domain.CrackingJob, err error) {
+	job.Status = domain.StatusFailed
+	job.ErrorMessage = err.Error()
+	s.repo.UpdateJob(ctx, job)
+}
+
+func (s *CrackingService) handleCancellation(ctx context.Context, job *domain.CrackingJob) {
+	job.Status = domain.StatusCancelled
+	job.EndTime = time.Now()
+	s.repo.UpdateJob(ctx, job)
+	s.stopAllAlgorithms()
+}
+
+func (s *CrackingService) stopAllAlgorithms() {
+	for _, alg := range s.algorithms {
+		alg.Stop()
+	}
+}
+
+func (s *CrackingService) GetProgress(ctx context.Context, jobID string) (*domain.JobProgress, error) {
+	metrics := s.metricsCollector.GetMetrics(jobID)
 	job, err := s.repo.GetJob(ctx, jobID)
 	if err != nil {
 		return nil, err
 	}
-	return job, nil
+
+	return &domain.JobProgress{
+		JobID:         jobID,
+		Status:        job.Status,
+		Progress:      metrics.Progress,
+		Speed:         metrics.Speed,
+		TimeRemaining: metrics.EstimatedTimeRemaining,
+		ActiveThreads: len(s.algorithms),
+	}, nil
 }
-
-func (s *CrackingService) StopJob(ctx context.Context, jobID string) error {
-	if _, exists := s.activeJobs.Load(jobID); !exists {
-		return domain.ErrJobNotFound
-	}
-
-	s.activeJobs.Delete(jobID)
-	s.metrics.StopCollection(jobID)
-
+func (s *CrackingService) StopCracking(ctx context.Context, jobID string) error {
 	job, err := s.repo.GetJob(ctx, jobID)
 	if err != nil {
 		return err
 	}
-
-	job.Status = domain.StatusStopped
-	job.EndTime = time.Now()
-	job.TimeTaken = job.EndTime.Sub(job.StartTime)
-
+	job.Status = domain.StatusCancelled
 	return s.repo.UpdateJob(ctx, job)
 }
 
-func (s *CrackingService) updateJobMetrics(jobID string, attempts int64) {
-	s.metrics.Update(jobID, metrics.MetricData{
-		Attempts:    attempts,
-		Timestamp:   time.Now(),
-		CPUUsage:    metrics.GetCPUUsage(),
-		MemoryUsage: metrics.GetMemoryUsage(),
-	})
-}
-
-func (s *CrackingService) analyzePassword(password string, startTime time.Time) domain.PasswordComplexity {
-	return domain.PasswordComplexity{
-		Score:       calculatePasswordScore(password),
-		Entropy:     calculateEntropy(password),
-		TimeToBreak: time.Since(startTime),
-		Strength:    determineStrengthLevel(password),
+func (s *CrackingService) GetResults(ctx context.Context, jobID string) (*domain.CrackingResult, error) {
+	job, err := s.repo.GetJob(ctx, jobID)
+	if err != nil {
+		return nil, err
 	}
+
+	return &domain.CrackingResult{
+		JobID:         job.ID,
+		Hash:          job.TargetHash,
+		FoundPassword: job.FoundPassword,
+		TimeTaken:     job.EndTime.Sub(job.StartTime).Seconds(),
+		Algorithm:     string(job.SuccessfulAlgorithm),
+	}, nil
 }

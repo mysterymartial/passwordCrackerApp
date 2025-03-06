@@ -4,14 +4,17 @@ import (
 	"context"
 	"passwordCrakerBackend/internal/core/domain"
 	"sync"
+	"sync/atomic"
 )
 
 type Hybrid struct {
-	settings   domain.CrackingSettings
-	progress   float64
-	mu         sync.RWMutex
-	stop       chan struct{}
-	algorithms []Algorithm
+	settings      domain.CrackingSettings
+	progress      float64
+	mu            sync.RWMutex
+	stop          chan struct{}
+	algorithms    []Algorithm
+	totalTried    uint64
+	totalPossible uint64
 }
 
 func NewHybrid() *Hybrid {
@@ -19,8 +22,8 @@ func NewHybrid() *Hybrid {
 		stop: make(chan struct{}),
 		algorithms: []Algorithm{
 			NewDictionary(),
+			NewBruteForce(),
 			NewMask(),
-			NewMarkov(),
 		},
 	}
 }
@@ -33,21 +36,28 @@ func (h *Hybrid) Start(ctx context.Context) (<-chan string, <-chan error) {
 		defer close(passwords)
 		defer close(errors)
 
-		// Create a channel for each algorithm
 		results := make([]<-chan string, len(h.algorithms))
 		errs := make([]<-chan error, len(h.algorithms))
 
-		// Start all algorithms
+		// Start all algorithms concurrently
 		for i, alg := range h.algorithms {
-			alg.SetSettings(h.settings)
 			results[i], errs[i] = alg.Start(ctx)
 		}
 
-		// Merge results using fan-in pattern
-		merged := h.fanIn(ctx, results...)
+		// Monitor errors from all algorithms
+		errChan := h.mergeErrors(ctx, errs...)
+		go func() {
+			for err := range errChan {
+				errors <- err
+			}
+		}()
 
-		// Process results
+		// Process passwords using fan-in pattern
+		merged := h.fanIn(ctx, results...)
 		for password := range merged {
+			atomic.AddUint64(&h.totalTried, 1)
+			h.updateProgress()
+
 			select {
 			case passwords <- password:
 			case <-ctx.Done():
@@ -65,24 +75,24 @@ func (h *Hybrid) fanIn(ctx context.Context, channels ...<-chan string) <-chan st
 	var wg sync.WaitGroup
 	multiplexed := make(chan string)
 
-	// Start a goroutine for each input channel
-	for _, ch := range channels {
-		wg.Add(1)
-		go func(c <-chan string) {
-			defer wg.Done()
-			for password := range c {
-				select {
-				case multiplexed <- password:
-				case <-ctx.Done():
-					return
-				case <-h.stop:
-					return
-				}
+	multiplex := func(c <-chan string) {
+		defer wg.Done()
+		for password := range c {
+			select {
+			case multiplexed <- password:
+			case <-ctx.Done():
+				return
+			case <-h.stop:
+				return
 			}
-		}(ch)
+		}
 	}
 
-	// Close multiplexed channel when all input channels are done
+	wg.Add(len(channels))
+	for _, ch := range channels {
+		go multiplex(ch)
+	}
+
 	go func() {
 		wg.Wait()
 		close(multiplexed)
@@ -91,7 +101,47 @@ func (h *Hybrid) fanIn(ctx context.Context, channels ...<-chan string) <-chan st
 	return multiplexed
 }
 
-// Required interface methods
+func (h *Hybrid) mergeErrors(ctx context.Context, channels ...<-chan error) <-chan error {
+	var wg sync.WaitGroup
+	merged := make(chan error)
+
+	merge := func(c <-chan error) {
+		defer wg.Done()
+		for err := range c {
+			select {
+			case merged <- err:
+			case <-ctx.Done():
+				return
+			case <-h.stop:
+				return
+			}
+		}
+	}
+
+	wg.Add(len(channels))
+	for _, ch := range channels {
+		go merge(ch)
+	}
+
+	go func() {
+		wg.Wait()
+		close(merged)
+	}()
+
+	return merged
+}
+
+func (h *Hybrid) updateProgress() {
+	h.mu.Lock()
+	defer h.mu.Unlock()
+
+	var totalProgress float64
+	for _, alg := range h.algorithms {
+		totalProgress += alg.Progress()
+	}
+	h.progress = totalProgress / float64(len(h.algorithms))
+}
+
 func (h *Hybrid) Stop() {
 	close(h.stop)
 	for _, alg := range h.algorithms {

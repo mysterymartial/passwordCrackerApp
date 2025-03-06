@@ -33,6 +33,8 @@ type CrackingSettings struct {
 	Priority       int
 	MaxAttempts    int64
 	RetryCount     int
+	HashType       HashType
+	TargetHash     string
 }
 
 type ProxySettings struct {
@@ -76,4 +78,21 @@ type WordlistEntry struct {
 	WordCount int64
 	Category  string
 	LastUsed  time.Time
+}
+
+type JobProgress struct {
+	JobID         string  `json:"jobId"`
+	Status        string  `json:"status"`
+	Progress      float64 `json:"progress"`
+	Speed         int64   `json:"speed"`
+	TimeRemaining int64   `json:"timeRemaining"`
+	ActiveThreads int     `json:"activeThreads"`
+}
+
+type CrackingResult struct {
+	JobID         string  `json:"jobId"`
+	Hash          string  `json:"hash"`
+	FoundPassword string  `json:"foundPassword,omitempty"`
+	TimeTaken     float64 `json:"timeTaken"`
+	Algorithm     string  `json:"algorithm"`
 }
