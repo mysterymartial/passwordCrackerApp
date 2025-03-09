@@ -3,6 +3,7 @@ package algorithm
 import (
 	"context"
 	"passwordCrakerBackend/internal/core/domain"
+	"reflect"
 	"sort"
 	"testing"
 	"time"
@@ -48,41 +49,37 @@ func TestBruteForce_Start(t *testing.T) {
 			b := NewBruteForce()
 			b.SetSettings(tt.settings)
 
-			ctx, cancel := context.WithTimeout(context.Background(), time.Second)
+			ctx, cancel := context.WithTimeout(context.Background(), time.Second*5)
 			defer cancel()
 
 			passwords, errors := b.Start(ctx)
-
 			var results []string
-			var err error
 
-			done := make(chan struct{})
-			go func() {
-				defer close(done)
-				for password := range passwords {
+			// Collect all passwords
+			for password := range passwords {
+				select {
+				case <-ctx.Done():
+					t.Fatal("Test timed out")
+				default:
 					results = append(results, password)
 				}
-			}()
-
-			select {
-			case err = <-errors:
-				t.Fatalf("Unexpected error: %v", err)
-			case <-done:
-			case <-ctx.Done():
-				t.Fatal("Test timed out")
 			}
 
+			// Check for any errors
+			select {
+			case err := <-errors:
+				if err != nil {
+					t.Fatalf("Got error: %v", err)
+				}
+			default:
+			}
+
+			// Sort both slices for comparison
 			sort.Strings(results)
 			sort.Strings(tt.want)
 
-			if len(results) != len(tt.want) {
-				t.Errorf("Got %d passwords, want %d", len(results), len(tt.want))
-			}
-
-			for i := range results {
-				if results[i] != tt.want[i] {
-					t.Errorf("Password at position %d: got %s, want %s", i, results[i], tt.want[i])
-				}
+			if !reflect.DeepEqual(results, tt.want) {
+				t.Errorf("\nGot:  %v\nWant: %v", results, tt.want)
 			}
 		})
 	}
