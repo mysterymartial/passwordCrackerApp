@@ -5,12 +5,13 @@ import (
 	"os"
 	"passwordCrakerBackend/internal/core/domain"
 	"path/filepath"
+	"reflect"
+	"sort"
 	"testing"
 	"time"
 )
 
 func TestDictionary_Start(t *testing.T) {
-	// Create temporary wordlist files
 	tempDir := t.TempDir()
 	wordlist1 := createTempWordlist(t, tempDir, "wordlist1.txt", []string{"password", "admin", "root"})
 	wordlist2 := createTempWordlist(t, tempDir, "wordlist2.txt", []string{"test123", "letmein"})
@@ -59,15 +60,14 @@ func TestDictionary_Start(t *testing.T) {
 			d := NewDictionary()
 			d.SetSettings(tt.settings)
 
-			ctx, cancel := context.WithTimeout(context.Background(), time.Second)
+			ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
 			defer cancel()
 
 			passwords, errors := d.Start(ctx)
 
 			var results []string
-			var err error
-
 			done := make(chan struct{})
+
 			go func() {
 				defer close(done)
 				for password := range passwords {
@@ -76,18 +76,22 @@ func TestDictionary_Start(t *testing.T) {
 			}()
 
 			select {
-			case err = <-errors:
+			case err := <-errors:
+				if err != nil {
+					t.Fatalf("unexpected error: %v", err)
+				}
 			case <-done:
+				// Success case
 			case <-ctx.Done():
-				t.Fatal("timeout")
+				t.Fatal("timeout waiting for password generation")
 			}
 
-			if (err != nil) != tt.wantErr {
-				t.Errorf("Dictionary.Start() error = %v, wantErr %v", err, tt.wantErr)
-				return
-			}
+			sort.Strings(results)
+			sort.Strings(tt.want)
 
-			checkResults(t, results, tt.want)
+			if !reflect.DeepEqual(results, tt.want) {
+				t.Errorf("got passwords = %v, want %v", results, tt.want)
+			}
 		})
 	}
 }

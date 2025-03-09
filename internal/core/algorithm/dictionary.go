@@ -29,19 +29,27 @@ func NewDictionary() *Dictionary {
 }
 
 func (d *Dictionary) Start(ctx context.Context) (<-chan string, <-chan error) {
-	passwords := make(chan string)
-	errors := make(chan error)
+	passwords := make(chan string, 1000)
+	errors := make(chan error, 1)
 
 	go func() {
 		defer close(passwords)
 		defer close(errors)
 
+		wg := sync.WaitGroup{}
 		for _, wordlistPath := range d.settings.WordlistPaths {
-			if err := d.processWordlist(ctx, wordlistPath, passwords); err != nil {
-				errors <- err
-				return
-			}
+			wg.Add(1)
+			go func(path string) {
+				defer wg.Done()
+				if err := d.processWordlist(ctx, path, passwords); err != nil {
+					select {
+					case errors <- err:
+					default:
+					}
+				}
+			}(wordlistPath)
 		}
+		wg.Wait()
 	}()
 
 	return passwords, errors
@@ -55,32 +63,38 @@ func (d *Dictionary) processWordlist(ctx context.Context, wordlistPath string, p
 	defer file.Close()
 
 	scanner := bufio.NewScanner(file)
-
 	for scanner.Scan() {
-		word := scanner.Text()
-		d.processedWords++
+		select {
+		case <-ctx.Done():
+			return ctx.Err()
+		default:
+			word := strings.TrimSpace(scanner.Text())
+			if word == "" {
+				continue
+			}
 
-		if err := d.processWord(ctx, word, passwords); err != nil {
-			return err
-		}
+			if err := d.sendWord(ctx, word, passwords); err != nil {
+				return err
+			}
 
-		if len(d.settings.CustomRules) > 0 {
 			for _, rule := range d.settings.CustomRules {
 				modified := d.applyRule(word, rule)
-				if err := d.processWord(ctx, modified, passwords); err != nil {
-					return err
+				if modified != word {
+					if err := d.sendWord(ctx, modified, passwords); err != nil {
+						return err
+					}
 				}
 			}
+
+			d.processedWords++
+			d.updateProgress()
 		}
-
-		d.updateProgress()
 	}
-
 	return scanner.Err()
 }
 
-func (d *Dictionary) processWord(ctx context.Context, word string, passwords chan<- string) error {
-	if len(word) < d.settings.MinLength || len(word) > d.settings.MaxLength {
+func (d *Dictionary) sendWord(ctx context.Context, word string, passwords chan<- string) error {
+	if len(word) < d.settings.MinLength || (d.settings.MaxLength > 0 && len(word) > d.settings.MaxLength) {
 		return nil
 	}
 
