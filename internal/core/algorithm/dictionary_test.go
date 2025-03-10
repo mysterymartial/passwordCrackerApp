@@ -95,7 +95,6 @@ func TestDictionary_Start(t *testing.T) {
 		})
 	}
 }
-
 func TestDictionary_Rules(t *testing.T) {
 	tests := []struct {
 		name     string
@@ -193,24 +192,4 @@ func createTempWordlist(t *testing.T, dir, name string, words []string) string {
 		}
 	}
 	return path
-}
-
-func checkResults(t *testing.T, got, want []string) {
-	found := make(map[string]bool)
-	for _, w := range want {
-		found[w] = false
-	}
-
-	for _, g := range got {
-		if _, ok := found[g]; !ok {
-			t.Errorf("Unexpected password generated: %s", g)
-		}
-		found[g] = true
-	}
-
-	for w, f := range found {
-		if !f {
-			t.Errorf("Expected password not generated: %s", w)
-		}
-	}
 }

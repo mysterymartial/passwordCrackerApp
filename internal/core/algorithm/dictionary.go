@@ -3,10 +3,12 @@ package algorithm
 import (
 	"bufio"
 	"context"
+	"log"
 	"os"
 	"passwordCrakerBackend/internal/core/domain"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"time"
 )
 
@@ -29,27 +31,19 @@ func NewDictionary() *Dictionary {
 }
 
 func (d *Dictionary) Start(ctx context.Context) (<-chan string, <-chan error) {
-	passwords := make(chan string, 1000)
-	errors := make(chan error, 1)
+	passwords := make(chan string)
+	errors := make(chan error)
 
 	go func() {
 		defer close(passwords)
 		defer close(errors)
 
-		wg := sync.WaitGroup{}
-		for _, wordlistPath := range d.settings.WordlistPaths {
-			wg.Add(1)
-			go func(path string) {
-				defer wg.Done()
-				if err := d.processWordlist(ctx, path, passwords); err != nil {
-					select {
-					case errors <- err:
-					default:
-					}
-				}
-			}(wordlistPath)
+		for _, path := range d.settings.WordlistPaths {
+			if err := d.processWordlist(ctx, path, passwords); err != nil {
+				errors <- err
+				return
+			}
 		}
-		wg.Wait()
 	}()
 
 	return passwords, errors
@@ -64,43 +58,41 @@ func (d *Dictionary) processWordlist(ctx context.Context, wordlistPath string, p
 
 	scanner := bufio.NewScanner(file)
 	for scanner.Scan() {
-		select {
-		case <-ctx.Done():
-			return ctx.Err()
-		default:
-			word := strings.TrimSpace(scanner.Text())
-			if word == "" {
-				continue
-			}
+		word := strings.TrimSpace(scanner.Text())
+		if word == "" {
+			continue
+		}
 
-			if err := d.sendWord(ctx, word, passwords); err != nil {
-				return err
-			}
+		// Debug log
+		log.Printf("Processing word: %s", word)
 
-			for _, rule := range d.settings.CustomRules {
-				modified := d.applyRule(word, rule)
-				if modified != word {
-					if err := d.sendWord(ctx, modified, passwords); err != nil {
-						return err
-					}
+		// Send original word
+		if err := d.sendWord(ctx, word, passwords); err != nil {
+			return err
+		}
+
+		// Process rules
+		for _, rule := range d.settings.CustomRules {
+			modified := d.applyRule(word, rule)
+			if modified != word { // Only send if the word was modified
+				// Debug log
+				log.Printf("Applying rule '%s' to word '%s': %s", rule, word, modified)
+
+				if err := d.sendWord(ctx, modified, passwords); err != nil {
+					return err
 				}
 			}
-
-			d.processedWords++
-			d.updateProgress()
 		}
 	}
+
 	return scanner.Err()
 }
 
 func (d *Dictionary) sendWord(ctx context.Context, word string, passwords chan<- string) error {
-	if len(word) < d.settings.MinLength || (d.settings.MaxLength > 0 && len(word) > d.settings.MaxLength) {
-		return nil
-	}
-
 	select {
 	case passwords <- word:
-		d.attempts++
+		atomic.AddInt64(&d.attempts, 1)
+		log.Printf("Sent word: %s", word) // Debug log
 		return nil
 	case <-ctx.Done():
 		return ctx.Err()
