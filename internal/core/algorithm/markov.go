@@ -207,11 +207,10 @@ func (m *Markov) partitionStates(states []string, workerID, totalWorkers int) []
 }
 
 func (m *Markov) generatePassword(initial string) string {
-	if len(initial) < m.settings.MinLength || len(initial) > m.settings.MaxLength {
-		return ""
-	}
-
+	// Start with the initial state regardless of its length
 	password := initial
+
+	// Generate until we reach MaxLength or can't predict further
 	for len(password) < m.settings.MaxLength {
 		current := password[len(password)-m.order:]
 		if next := m.predictNextChar(current); next != "" {
@@ -221,7 +220,8 @@ func (m *Markov) generatePassword(initial string) string {
 		}
 	}
 
-	if len(password) >= m.settings.MinLength {
+	// Only return if within bounds
+	if len(password) >= m.settings.MinLength && len(password) <= m.settings.MaxLength {
 		return password
 	}
 	return ""

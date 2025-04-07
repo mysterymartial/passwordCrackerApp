@@ -3,6 +3,7 @@ package algorithm
 import (
 	"context"
 	"fmt"
+	"log" // Added for debugging
 	"passwordCrakerBackend/internal/core/domain"
 	"regexp"
 	"strconv"
@@ -36,8 +37,8 @@ func NewMask() *Mask {
 }
 
 func (m *Mask) Start(ctx context.Context) (<-chan string, <-chan error) {
-	passwords := make(chan string)
-	errors := make(chan error)
+	passwords := make(chan string, 100) // Buffered to prevent blocking
+	errors := make(chan error, 1)       // Buffered error channel
 
 	go func() {
 		defer close(passwords)
@@ -50,7 +51,6 @@ func (m *Mask) Start(ctx context.Context) (<-chan string, <-chan error) {
 
 		m.totalPatterns = int64(len(m.settings.CustomRules))
 
-		// Use worker pool for parallel processing
 		workerCount := 4
 		patternChan := make(chan string, m.totalPatterns)
 
@@ -60,7 +60,6 @@ func (m *Mask) Start(ctx context.Context) (<-chan string, <-chan error) {
 			go m.worker(ctx, patternChan, passwords, errors, &wg)
 		}
 
-		// Feed patterns to workers
 		for _, rule := range m.settings.CustomRules {
 			patternChan <- rule
 		}
@@ -78,7 +77,7 @@ func (m *Mask) worker(ctx context.Context, patterns <-chan string, passwords cha
 	for pattern := range patterns {
 		masks := m.expandMaskPattern(pattern)
 		for _, mask := range masks {
-			if err := m.generateFromMask(ctx, mask, "", passwords); err != nil {
+			if err := m.generateFromMask(ctx, mask, passwords); err != nil {
 				select {
 				case errors <- err:
 				case <-ctx.Done():
@@ -93,29 +92,34 @@ func (m *Mask) worker(ctx context.Context, patterns <-chan string, passwords cha
 }
 
 func (m *Mask) expandMaskPattern(pattern string) []string {
-	var masks []string
-
 	if strings.HasPrefix(pattern, "?") {
-		masks = append(masks, pattern)
-		return masks
+		return []string{pattern}
 	}
 
 	re := regexp.MustCompile(`\[([^\]]+)\]\{(\d+)\}`)
 	matches := re.FindAllStringSubmatch(pattern, -1)
 
-	if len(matches) > 0 {
-		var expandedMask strings.Builder
-		for _, match := range matches {
-			charsetType := match[1]
-			count, _ := strconv.Atoi(match[2])
-
-			charsetSymbol := m.getCharsetSymbol(charsetType)
-			expandedMask.WriteString(strings.Repeat(charsetSymbol, count))
-		}
-		masks = append(masks, expandedMask.String())
+	if len(matches) == 0 {
+		return []string{pattern}
 	}
 
-	return masks
+	var expandedMask strings.Builder
+	lastPos := 0
+	for _, match := range matches {
+		start := re.FindStringIndex(pattern[lastPos:])[0] + lastPos
+		expandedMask.WriteString(pattern[lastPos:start])
+
+		charsetType := match[1]
+		count, _ := strconv.Atoi(match[2])
+		charsetSymbol := m.getCharsetSymbol(charsetType)
+		expandedMask.WriteString(strings.Repeat(charsetSymbol, count))
+
+		lastPos = start + len(match[0])
+	}
+	expandedMask.WriteString(pattern[lastPos:])
+
+	log.Printf("Expanded pattern %s to %s", pattern, expandedMask.String())
+	return []string{expandedMask.String()}
 }
 
 func (m *Mask) getCharsetSymbol(charsetType string) string {
@@ -135,30 +139,89 @@ func (m *Mask) getCharsetSymbol(charsetType string) string {
 	}
 }
 
-func (m *Mask) generateFromMask(ctx context.Context, mask, current string, passwords chan<- string) error {
-	if len(current) > m.settings.MaxLength {
-		return nil
+func (m *Mask) generateFromMask(ctx context.Context, mask string, passwords chan<- string) error {
+	// Parse mask into parts
+	var parts []struct {
+		charset string
+		isMask  bool
 	}
-
-	if len(current) >= m.settings.MinLength && len(current) <= m.settings.MaxLength {
-		atomic.AddInt64(&m.attempts, 1)
-		select {
-		case passwords <- current:
-		case <-ctx.Done():
-			return ctx.Err()
-		case <-m.stop:
-			return nil
+	for i := 0; i < len(mask); i++ {
+		if i+1 < len(mask) && mask[i] == '?' {
+			charset, ok := m.charsets[rune(mask[i+1])]
+			if !ok {
+				return fmt.Errorf("unknown charset symbol: %c", mask[i+1])
+			}
+			log.Printf("Charset for ?%c: %s", mask[i+1], charset) // Debug charset
+			parts = append(parts, struct {
+				charset string
+				isMask  bool
+			}{charset, true})
+			i++ // Skip the next char
+		} else {
+			parts = append(parts, struct {
+				charset string
+				isMask  bool
+			}{string(mask[i]), false})
 		}
 	}
 
-	if len(mask) < 2 || mask[0] != '?' {
-		return nil
+	// Calculate total combinations to ensure progress tracking
+	totalCombinations := int64(1)
+	for _, part := range parts {
+		if part.isMask {
+			totalCombinations *= int64(len(part.charset))
+		}
 	}
 
-	charset := m.charsets[rune(mask[1])]
-	for _, char := range charset {
-		if err := m.generateFromMask(ctx, mask[2:], current+string(char), passwords); err != nil {
-			return err
+	// Generate all combinations iteratively
+	var current []string
+	for i := range parts {
+		current = append(current, "")
+	}
+	pos := 0
+
+	for {
+		// Build the current password
+		var password strings.Builder
+		for i, part := range parts {
+			if part.isMask {
+				if current[i] == "" && pos == i {
+					current[i] = string(part.charset[0])
+				}
+				password.WriteString(current[i])
+			} else {
+				password.WriteString(part.charset)
+			}
+		}
+
+		// Send password if within bounds
+		pwd := password.String()
+		if len(pwd) >= m.settings.MinLength && len(pwd) <= m.settings.MaxLength {
+			atomic.AddInt64(&m.attempts, 1)
+			select {
+			case passwords <- pwd:
+				log.Printf("Generated password: %s", pwd) // Debug output
+			case <-ctx.Done():
+				return ctx.Err()
+			case <-m.stop:
+				return nil
+			}
+		}
+
+		// Move to next combination
+		for pos = len(parts) - 1; pos >= 0; pos-- {
+			if !parts[pos].isMask {
+				continue
+			}
+			idx := strings.Index(parts[pos].charset, current[pos])
+			if idx+1 < len(parts[pos].charset) {
+				current[pos] = string(parts[pos].charset[idx+1])
+				break
+			}
+			current[pos] = string(parts[pos].charset[0])
+		}
+		if pos < 0 {
+			break // All combinations exhausted
 		}
 	}
 

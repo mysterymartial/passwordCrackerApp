@@ -66,8 +66,10 @@ func TestDictionary_Start(t *testing.T) {
 			passwords, errors := d.Start(ctx)
 
 			var results []string
+			var err error
 			done := make(chan struct{})
 
+			// Collect passwords
 			go func() {
 				defer close(done)
 				for password := range passwords {
@@ -75,15 +77,32 @@ func TestDictionary_Start(t *testing.T) {
 				}
 			}()
 
+			// Wait for completion, error, or timeout
 			select {
-			case err := <-errors:
-				if err != nil {
+			case <-done:
+				// Check for errors after collecting all passwords
+				select {
+				case err = <-errors:
+					if err != nil { // Only fail on non-nil errors
+						if !tt.wantErr {
+							t.Fatalf("unexpected error: %v", err)
+						}
+						return
+					}
+				default:
+					// No error, proceed
+				}
+			case err = <-errors:
+				if err != nil && !tt.wantErr {
 					t.Fatalf("unexpected error: %v", err)
 				}
-			case <-done:
-				// Success case
+				return
 			case <-ctx.Done():
 				t.Fatal("timeout waiting for password generation")
+			}
+
+			if tt.wantErr {
+				t.Fatal("expected an error but got none")
 			}
 
 			sort.Strings(results)
@@ -95,6 +114,7 @@ func TestDictionary_Start(t *testing.T) {
 		})
 	}
 }
+
 func TestDictionary_Rules(t *testing.T) {
 	tests := []struct {
 		name     string

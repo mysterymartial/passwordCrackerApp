@@ -31,19 +31,41 @@ func NewDictionary() *Dictionary {
 }
 
 func (d *Dictionary) Start(ctx context.Context) (<-chan string, <-chan error) {
-	passwords := make(chan string)
-	errors := make(chan error)
+	passwords := make(chan string, 100) // Buffered channel
+	errors := make(chan error, 1)       // Buffered error channel
 
 	go func() {
 		defer close(passwords)
-		defer close(errors)
 
+		var wg sync.WaitGroup
+		errChan := make(chan error, len(d.settings.WordlistPaths))
+
+		// Launch goroutines for each wordlist
 		for _, path := range d.settings.WordlistPaths {
-			if err := d.processWordlist(ctx, path, passwords); err != nil {
+			wg.Add(1)
+			go func(path string) {
+				defer wg.Done()
+				if err := d.processWordlist(ctx, path, passwords); err != nil {
+					errChan <- err
+				}
+			}(path)
+		}
+
+		// Wait for all wordlists to complete
+		wg.Wait()
+		close(errChan)
+
+		// Check for any errors
+		for err := range errChan {
+			if err != nil {
 				errors <- err
+				close(errors)
 				return
 			}
 		}
+
+		// No errors, close errors channel
+		close(errors)
 	}()
 
 	return passwords, errors
@@ -83,6 +105,10 @@ func (d *Dictionary) processWordlist(ctx context.Context, wordlistPath string, p
 				}
 			}
 		}
+
+		// Update progress
+		atomic.AddInt64(&d.processedWords, 1)
+		d.updateProgress()
 	}
 
 	return scanner.Err()
@@ -92,7 +118,7 @@ func (d *Dictionary) sendWord(ctx context.Context, word string, passwords chan<-
 	select {
 	case passwords <- word:
 		atomic.AddInt64(&d.attempts, 1)
-		log.Printf("Sent word: %s", word) // Debug log
+		log.Printf("Sent word: %s", word)
 		return nil
 	case <-ctx.Done():
 		return ctx.Err()
@@ -138,7 +164,9 @@ func (d *Dictionary) applyRule(word, rule string) string {
 func (d *Dictionary) updateProgress() {
 	d.mu.Lock()
 	defer d.mu.Unlock()
-	d.progress = float64(d.processedWords) / float64(d.totalWords) * 100
+	if d.totalWords > 0 {
+		d.progress = float64(d.processedWords) / float64(d.totalWords) * 100
+	}
 }
 
 func (d *Dictionary) Stop() {
