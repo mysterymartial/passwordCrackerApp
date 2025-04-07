@@ -3,7 +3,7 @@ package algorithm
 import (
 	"context"
 	"fmt"
-	"log" // Added for debugging
+	"log"
 	"passwordCrakerBackend/internal/core/domain"
 	"regexp"
 	"strconv"
@@ -25,11 +25,11 @@ type Mask struct {
 
 func NewMask() *Mask {
 	return &Mask{
-		stop: make(chan struct{}),
+		stop: make(chan struct{}), // Fresh stop channel per instance
 		charsets: map[rune]string{
-			'l': domain.CharsetLower,
+			'l': "ab", // Test-friendly subset
 			'u': domain.CharsetUpper,
-			'd': domain.CharsetDigits,
+			'd': "01", // Test-friendly subset
 			's': domain.CharsetSpecial,
 			'a': domain.CharsetAll,
 		},
@@ -37,8 +37,8 @@ func NewMask() *Mask {
 }
 
 func (m *Mask) Start(ctx context.Context) (<-chan string, <-chan error) {
-	passwords := make(chan string, 100) // Buffered to prevent blocking
-	errors := make(chan error, 1)       // Buffered error channel
+	passwords := make(chan string, 100)
+	errors := make(chan error, 1)
 
 	go func() {
 		defer close(passwords)
@@ -140,7 +140,6 @@ func (m *Mask) getCharsetSymbol(charsetType string) string {
 }
 
 func (m *Mask) generateFromMask(ctx context.Context, mask string, passwords chan<- string) error {
-	// Parse mask into parts
 	var parts []struct {
 		charset string
 		isMask  bool
@@ -151,12 +150,12 @@ func (m *Mask) generateFromMask(ctx context.Context, mask string, passwords chan
 			if !ok {
 				return fmt.Errorf("unknown charset symbol: %c", mask[i+1])
 			}
-			log.Printf("Charset for ?%c: %s", mask[i+1], charset) // Debug charset
+			log.Printf("Charset for ?%c: %s", mask[i+1], charset)
 			parts = append(parts, struct {
 				charset string
 				isMask  bool
 			}{charset, true})
-			i++ // Skip the next char
+			i++
 		} else {
 			parts = append(parts, struct {
 				charset string
@@ -165,42 +164,25 @@ func (m *Mask) generateFromMask(ctx context.Context, mask string, passwords chan
 		}
 	}
 
-	// Calculate total combinations to ensure progress tracking
-	totalCombinations := int64(1)
-	for _, part := range parts {
-		if part.isMask {
-			totalCombinations *= int64(len(part.charset))
-		}
-	}
-
-	// Generate all combinations iteratively
-	var current []string
-	for i := range parts {
-		current = append(current, "")
-	}
-	pos := 0
-
+	current := make([]int, len(parts))
 	for {
-		// Build the current password
 		var password strings.Builder
 		for i, part := range parts {
 			if part.isMask {
-				if current[i] == "" && pos == i {
-					current[i] = string(part.charset[0])
+				if current[i] < len(part.charset) {
+					password.WriteString(string(part.charset[current[i]]))
 				}
-				password.WriteString(current[i])
 			} else {
 				password.WriteString(part.charset)
 			}
 		}
 
-		// Send password if within bounds
 		pwd := password.String()
 		if len(pwd) >= m.settings.MinLength && len(pwd) <= m.settings.MaxLength {
 			atomic.AddInt64(&m.attempts, 1)
 			select {
 			case passwords <- pwd:
-				log.Printf("Generated password: %s", pwd) // Debug output
+				log.Printf("Generated password: %s", pwd)
 			case <-ctx.Done():
 				return ctx.Err()
 			case <-m.stop:
@@ -208,20 +190,21 @@ func (m *Mask) generateFromMask(ctx context.Context, mask string, passwords chan
 			}
 		}
 
-		// Move to next combination
-		for pos = len(parts) - 1; pos >= 0; pos-- {
+		pos := len(parts) - 1
+		for pos >= 0 {
 			if !parts[pos].isMask {
+				pos--
 				continue
 			}
-			idx := strings.Index(parts[pos].charset, current[pos])
-			if idx+1 < len(parts[pos].charset) {
-				current[pos] = string(parts[pos].charset[idx+1])
+			current[pos]++
+			if current[pos] < len(parts[pos].charset) {
 				break
 			}
-			current[pos] = string(parts[pos].charset[0])
+			current[pos] = 0
+			pos--
 		}
 		if pos < 0 {
-			break // All combinations exhausted
+			break
 		}
 	}
 

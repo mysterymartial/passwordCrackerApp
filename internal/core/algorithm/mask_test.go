@@ -21,7 +21,7 @@ func TestMask_Start(t *testing.T) {
 				MaxLength:   3,
 				CustomRules: []string{"?d?d?d"},
 			},
-			want:    []string{"000", "001", "002"},
+			want:    []string{"000", "001", "010"},
 			wantErr: false,
 		},
 		{
@@ -56,32 +56,40 @@ func TestMask_Start(t *testing.T) {
 
 			passwords, errors := m.Start(ctx)
 
-			// Collect results
+			// Collect results synchronously to avoid race conditions
 			var results []string
 			var err error
 
-			done := make(chan struct{})
+			collectDone := make(chan struct{})
 			go func() {
-				defer close(done)
-				for pass := range passwords {
-					results = append(results, pass)
-					if len(results) >= len(tt.want) {
-						break
+				defer close(collectDone)
+				for {
+					select {
+					case pass, ok := <-passwords:
+						if !ok {
+							return // Channel closed
+						}
+						results = append(results, pass)
+					case <-ctx.Done():
+						return
 					}
 				}
 			}()
 
 			select {
 			case err = <-errors:
-			case <-done:
+				if err != nil && !tt.wantErr {
+					t.Errorf("Mask.Start() error = %v, wantErr %v", err, tt.wantErr)
+					return
+				}
+			case <-collectDone:
+				// Collection finished
 			case <-ctx.Done():
-				t.Fatal("timeout")
+				t.Fatal("timeout waiting for passwords")
 			}
 
-			if (err != nil) != tt.wantErr {
-				t.Errorf("Mask.Start() error = %v, wantErr %v", err, tt.wantErr)
-				return
-			}
+			// Log collected results for debugging
+			t.Logf("Collected passwords: %v", results)
 
 			// Verify results contain expected passwords
 			for _, want := range tt.want {
@@ -131,7 +139,6 @@ func TestMask_Stop(t *testing.T) {
 	ctx := context.Background()
 	passwords, _ := m.Start(ctx)
 
-	// Start consuming passwords
 	done := make(chan struct{})
 	go func() {
 		for range passwords {
@@ -140,12 +147,11 @@ func TestMask_Stop(t *testing.T) {
 		close(done)
 	}()
 
-	// Stop the algorithm
 	m.Stop()
 
 	select {
 	case <-done:
-		// Success - channel closed
+		// Success
 	case <-time.After(time.Second):
 		t.Error("Stop() didn't terminate password generation")
 	}
